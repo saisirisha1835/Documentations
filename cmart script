@@ -1,0 +1,373 @@
+node('jenkins_uat_sdg_1g'){
+    
+    env.JAVA_HOME="${tool 'JDK1.7'}"
+    env.PATH="${env.JAVA_HOME}/bin:${env.PATH}"
+    
+    try{
+        
+        //deleteDir()
+        
+        def build_ok = true
+        
+        stage('Checkouts'){
+            parallel 'sources':{
+            try{
+                stage('source code'){
+                    echo 'Checking out source code...'
+                    withCredentials([usernamePassword(credentialsId: 'SVN_CMT', passwordVariable: 'myPword', usernameVariable: 'myUname')]) {
+                        // masking the credentials
+                        bat label: 'source code checkout', script: 'svn export --non-interactive --no-auth-cache --username %myUname% --password %myPword% https://mlxsdgsvn.icicibankltd.com/svn/T04_3200_CMART/CMART/SourceCode/%folderName%/ D:\\JenkinsAgentNode\\workspace\\CMART_SDG\\CMART\\source_code --trust-server-cert --force'
+                    }
+                    echo 'Successfully checkout source code repo!'
+                }
+            }catch(err){
+                echo 'Unable to checkout sources repo...'
+                currentBuild.result = "FAILURE"
+                error()
+            }
+        }, 'rel-notes':{
+                try{
+                    stage('release note'){
+                        echo 'Checking out release note repo...'
+                        checkout([$class: 'SubversionSCM', additionalCredentials: [], excludedCommitMessages: '', excludedRegions: '', excludedRevprop: '', excludedUsers: '', filterChangelog: false, ignoreDirPropChanges: false, includedRegions: '', locations: [[cancelProcessOnExternalsFail: true, credentialsId: 'SVN_CMT', depthOption: 'infinity', ignoreExternalsOption: true, local: 'rel_notes', remote: 'https://mlxsdgsvn.icicibankltd.com/svn/T04_3200_CMART/CMART/ReleaseNotes']], quietOperation: true, workspaceUpdater: [$class: 'UpdateUpdater']])
+                        echo 'Successfully checked out release note repo!'
+                    }
+                }catch(err){
+                    echo 'Unable to checkout release note repo...'
+                    currentBuild.result = "FAILURE"
+                    error()
+                }
+            }
+        }
+        
+        try{
+            stage('Compilation-MVN'){
+                echo "Begining to compile the code"
+                bat label: 'maven-phase', script: '"D:\\Apache Build Tools\\apache-maven-3.6.1-bin\\apache-maven-3.6.1\\bin\\mvn" -o -f source_code/parent/pom.xml clean install -e'
+                echo "Successfully compiled"
+                successfulBuildTransitionIssue()
+                CIP2DepTransitionIssue()
+            }
+        }catch(error){
+            println("Unable to compile...there were some errors!")
+            currentBuild.result = "FAILURE"
+            createJira()
+            unsuccessfulBuildTransitionIssue()
+            error()      
+        }
+        
+        try{
+            stage('JUnit'){
+                //junit './source_code/cmart-web/target/surefire-reports/*.xml'
+                echo 'Junit was done in the previous stage'
+            }
+        }catch(err){
+            println("Unable to generate reports!")
+            currentBuild.result = "FAILURE"
+        }
+        
+        try{
+           stage('Code Inspection-Analysis'){
+               withMaven(jdk: 'JDK1.8', maven: 'MAVEN_HOME_110'){
+                  withSonarQubeEnv('SonarServer'){
+                       bat label: 'sonar-analyis', script: '"D:\\Apache Build Tools\\apache-maven-3.6.1-bin\\apache-maven-3.6.1\\bin\\mvn" org.sonarsource.scanner.maven:sonar-maven-plugin:3.6.0.1398:sonar -f source_code/parent/pom.xml -Dsonar.host.url=http://10.75.21.110:9500 -Dsonar.login=c8325b1f0dee631620974534c87d9a4b4cf180c6'
+                   }
+               }
+           }
+       }catch(err){
+            println("Unable to perform code quality analysis!")
+            currentBuild.result = "FAILURE"
+            error()
+       }
+       
+       try{
+            stage('Analysis Report'){
+                timeout(time: 10, unit: 'MINUTES'){
+                    def qg = waitForQualityGate()
+                    if(qg.status != 'OK'){
+                        error "Pipeline aborted due to quality gate failure: ${qg.status}"
+                    }
+                }
+            }
+        }catch(err){
+            println("Quality gate computation has somehow failed")
+            currentBuild.result = "FAILURE"
+            build_ok = false
+            createJira()
+        }
+        
+       stage('Approval to proceed?'){
+            
+            input id: '200', message: 'Continue post code analysis stage?', ok: 'Approved', submitter: 'ganesh'
+        }
+        
+        try{
+            stage('Nexus'){
+                echo "Beginning to publish artifact(s) to a nexus repo"
+                nexusPublisher nexusInstanceId: '10E24CDC-082CBE5F-99B7ECD6-734F6CFA-6D6CD16C', nexusRepositoryId: 'cmart-dev', packages: [[$class: 'MavenPackage', mavenAssetList: [[classifier: 'DC', extension: '', filePath: './source_code/cmart-report/target/cmart-report.war']], mavenCoordinate: [artifactId: 'cmart-report', groupId: 'com.icicibank.sdg', packaging: 'war', version: '$BUILD_TIMESTAMP']], [$class: 'MavenPackage', mavenAssetList: [[classifier: 'DC', extension: '', filePath: './source_code/cmart-web/target/cmart-web.war']], mavenCoordinate: [artifactId: 'cmart-web', groupId: 'com.icicibank.sdg', packaging: 'war', version: '$BUILD_TIMESTAMP']], [$class: 'MavenPackage', mavenAssetList: [[classifier: 'DC', extension: '', filePath: './source_code/cmart-web-scheduler/target/cmart-web-scheduler.war']], mavenCoordinate: [artifactId: 'cmart-web-scheduler', groupId: 'com.icicibank.sdg', packaging: 'war', version: '$BUILD_TIMESTAMP']]]
+                echo "Successfully published artifact(s) "
+            }
+        }catch(error){
+            println("Unable to transfer artifacts...there were some errors!")
+            currentBuild.result = "FAILURE"
+            error()
+        }
+        
+        try{
+            stage("CherryPicker"){
+                println('Now proceeding with selective file picking')
+                bat label: 'file-pick', script: '"C:\\Users\\Netadmin\\Desktop\\JCherryPicker.exe" --path "%WORKSPACE%\\rel_notes\\Release_Note_2019-08-19_%CRN%_Live.xls" --workspace "%WORKSPACE%\\source_code"'
+                print('Now performing SVN commit...')
+                bat label: 'svn-commit-phase', script: '"C:\\Users\\Netadmin\\Documents\\svncommit.bat"'
+            }
+        } catch(err){
+            println('Unable to selectively pick file(s)')
+            currentBuild.result = "FAILURE"
+            error()
+        }
+        
+        try{
+            stage('Deployment'){
+                node('jenkins_uat_cmart_180'){
+                    deleteDir()
+                    echo 'Checking out binary directory'
+                    checkout([$class: 'SubversionSCM', additionalCredentials: [], excludedCommitMessages: '', excludedRegions: '', excludedRevprop: '', excludedUsers: '', filterChangelog: false, ignoreDirPropChanges: false, includedRegions: '', locations: [[cancelProcessOnExternalsFail: true, credentialsId: 'SVN_CMT', depthOption: 'infinity', ignoreExternalsOption: true, local: 'bin', remote: 'https://mlxsdgsvn.icicibankltd.com/svn/T04_3200_CMART/CMART/DeployWar@HEAD']], quietOperation: true, workspaceUpdater: [$class: 'UpdateUpdater']])
+                    echo 'Checking out release notes directory'
+                    checkout([$class: 'SubversionSCM', additionalCredentials: [], excludedCommitMessages: '', excludedRegions: '', excludedRevprop: '', excludedUsers: '', filterChangelog: false, ignoreDirPropChanges: false, includedRegions: '', locations: [[cancelProcessOnExternalsFail: true, credentialsId: 'SVN_CMT', depthOption: 'infinity', ignoreExternalsOption: true, local: 'rel_notes', remote: 'https://mlxsdgsvn.icicibankltd.com/svn/T04_3200_CMART/CMART/ReleaseNotes']], quietOperation: true, workspaceUpdater: [$class: 'UpdateUpdater']])
+                    bat label: '', script: 'rmdir /Q /S "%appLocPatch%"'
+                    bat label: '', script: '"C:\\FileUtils\\JCherryPicker.exe" --path "%WORKSPACE%\\rel_notes\\Release_Note_2019-08-19_%CRN%_Live.xls" --workspace "D:\\Oracle\\user_projects\\domains\\CMART\\servers\\%targetnode%\\stage"'
+                    bat label: 'unzipper-180', script: '"C:\\FileUtils\\unzipper.exe" --path "C:\\Users\\op_tsg4\\Desktop\\JavaIF"'
+                    bat label: 'patch-ren-phase', script: '"C:\\FileUtils\\rename.bat"'
+                    bat label: 'unzipper-180', script: '"C:\\FileUtils\\unzipper.exe" --path "%WORKSPACE%\\bin"'
+                    print('Now proceeding for deployment')
+                    input id: '200', message: 'Continue with the Deployment?', ok: 'Approved', submitter: 'ganesh'
+                    bat label: 'deploy-phase', script: '"D:\\Oracle\\oracle_common\\common\\bin\\wlst.cmd" "C:\\WLST_Deploy\\wlDeploy.py"'
+                    println 'DEPLOYMENT IS SUCCESSFUL!'
+                    currentBuild.displayName = "${env.BUILD_TIMESTAMP}"
+                    successfulDeployTransitionIssue()
+                    FTA2TestTransitionIssue()
+                }
+            }
+        }catch(err){
+            echo 'Now performing rollback as deployment has failed'
+            //build job: 'Rollback', parameters: [string(name: 'CRN', value: String.valueOf(CRN)), string(name: 'appLocBkp', value: String.valueOf(appLocBkp))]
+            println("=================ERROR: ${err}")
+            currentBuild.displayName = "${env.BUILD_TIMESTAMP}"
+            currentBuild.result = "FAILURE"
+            unsuccessfulDeployTransitionIssue()
+            error()
+        }
+        
+        stage('FTA Pre-Approval'){
+            input id: '200', message: 'Continue with TA?', ok: 'Approved', submitter: 'ganesh'
+        }
+        
+        try{
+            stage('FTA'){
+                /*node('jenkins_fcrs_84'){
+                    deleteDir()
+                    echo 'performing TA tests'
+                    bat label: 'source code checkout', script: 'svn export --non-interactive --no-auth-cache --username BAN77068 --password infotech@22 https://mlxsdgsvn.icicibankltd.com/svn/T04_3200_CMART/CMART/Other_Documents/CMART_TA/ D:\\jenkins\\workspace\\CMART_SDG\\CMART --trust-server-cert --force'
+                    withAnt(installation: 'Ant_84', jdk: 'JDK18_84') {
+                        bat label: '', script: 'ant testng-exec'
+                    }
+                    echo 'tests successful'
+                }*/
+                echo 'performing TA tests'
+                build job: 'test', propagate: true, wait: true
+                echo 'TA is successful'
+            }
+        }catch(err){
+            build_ok = false
+            println("ERROR: ${err}")
+            currentBuild.displayName = "${env.BUILD_TIMESTAMP}"
+            currentBuild.result = "FAILURE"
+            createJira()
+            unsuccessfulTestTransitionIssue()
+        }
+        
+        stage('FTA Post-Approval'){
+            input id: '200', message: 'Continue post TA?', ok: 'Approved', submitter: 'ganesh'
+        }
+        
+        stage('UAT'){
+            echo 'UAT in WIP'
+        }
+        
+        if(build_ok) {
+            currentBuild.result = "SUCCESS"
+        } else {
+            currentBuild.result = "FAILURE"
+        }
+        
+    } catch(err){
+        println("=================ERROR: ${err}")
+        currentBuild.displayName = "${env.BUILD_TIMESTAMP}"
+        currentBuild.result = "FAILURE"
+        error()
+    } 
+}
+
+def createJira(){
+    withEnv(['JIRA_SITE=JIRA_CMART']){
+        def failIssue = [fields: [project: [id: 10602],
+                        summary: ''+CRN+' Jenkins execution bug',
+                        description: ''+CRN+ ' has failed. Please do the needful',
+                        issuetype: [name: 'Bug']]]
+        response = jiraNewIssue issue: failIssue
+        echo response.successful.toString()
+        echo response.data.toString()
+    }
+}
+
+def successfulBuildTransitionIssue(){
+    withEnv(['JIRA_SITE=JIRA_CMART']){
+        def build = /project = 'SDG-CMART' AND Sprint =/ + SPN +/ AND statusCategory = 'In Progress' AND status = 'Jenkins DEV WIP'/
+        //def searchResults = jiraJqlSearch jql: "project = 'SDG-CMART' AND Sprint = 362 AND statusCategory = 'In Progress' AND status = 'Jenkins DEV WIP'"
+        def searchResults = jiraJqlSearch jql: build
+        def issues = searchResults.data.issues
+        def comment = [ body: 'Comment from Jenkins. Positive transition for %BUILD_DISPLAY_NAME%' ]
+        for (i = 0; i <issues.size(); i++) {
+            def transitionInput = [
+                transition: [
+                    id: '91'
+                ]
+            ]
+            jiraTransitionIssue idOrKey: issues[i].key, input: transitionInput
+            jiraAddComment idOrKey: issues[i].key, input: comment
+        }
+    }
+}
+
+def unsuccessfulBuildTransitionIssue(){
+    withEnv(['JIRA_SITE=JIRA_CMART']){
+        //def searchResultsQuery = jiraJqlSearch jql: "project = 'SDG-CMART' AND Sprint = 362 AND statusCategory = 'In Progress' AND status = 'Jenkins DEV WIP'"
+        def build = /project = 'SDG-CMART' AND Sprint =/ + SPN +/ AND statusCategory = 'In Progress' AND status = 'Jenkins DEV WIP'/
+        def searchResults = jiraJqlSearch jql: build
+        def issueNos = searchResultsQuery.data.issues
+        def comment = [ body: 'Comment from Jenkins. Negative transition for %BUILD_DISPLAY_NAME%!' ]
+        for (i = 0; i < issueNos.size(); i++){
+            def transInput = [
+                transition: [
+                    id: '101'
+                ]
+            ]
+            jiraTransitionIssue idOrKey: issueNos[i].key, input: transInput
+            jiraAddComment idOrKey: issueNos[i].key, input: comment
+        }
+    }
+}
+
+def CIP2DepTransitionIssue(){
+    withEnv(['JIRA_SITE=JIRA_CMART']){
+        //def searchResults = jiraJqlSearch jql: "project = 'SDG-CMART' AND Sprint = 362 AND statusCategory = 'Done' AND status = 'CI Pass'"
+        def build = /project = 'SDG-CMART' AND Sprint =/ + SPN +/ AND statusCategory = 'In Progress' AND status = 'Jenkins DEV WIP'/
+        def searchResults = jiraJqlSearch jql: build
+        def issues = searchResults.data.issues
+        def comment = [ body: 'Comment from Jenkins. Positive transition for deployment in %BUILD_DISPLAY_NAME%!' ]
+        for (i = 0; i <issues.size(); i++) {
+            def transitionInput = [
+                transition: [
+                    id: '121'
+                ]
+            ]
+            jiraTransitionIssue idOrKey: issues[i].key, input: transitionInput
+            jiraAddComment idOrKey: issues[i].key, input: comment
+        }
+    }
+}
+
+def successfulDeployTransitionIssue(){
+    withEnv(['JIRA_SITE=JIRA_CMART']){
+        //def searchResults = jiraJqlSearch jql: "project = 'SDG-CMART' AND Sprint = 362 AND statusCategory = 'In Progress' AND status = 'DEV Deploy WIP'"
+        def build = /project = 'SDG-CMART' AND Sprint =/ + SPN +/ AND statusCategory = 'In Progress' AND status = 'Jenkins DEV WIP'/
+        def searchResults = jiraJqlSearch jql: build
+        def issues = searchResults.data.issues
+        def comment = [ body: 'Comment from Jenkins. Positive transition for deployment in %BUILD_DISPLAY_NAME%!' ]
+        for (i = 0; i <issues.size(); i++) {
+            def transitionInput = [
+                transition: [
+                    id: '131'
+                ]
+            ]
+            jiraTransitionIssue idOrKey: issues[i].key, input: transitionInput
+            jiraAddComment idOrKey: issues[i].key, input: comment
+        }
+    }
+}
+
+def unsuccessfulDeployTransitionIssue(){
+    withEnv(['JIRA_SITE=JIRA_CMART']){
+        //def searchResultsQuery = jiraJqlSearch jql: "project = 'SDG-CMART' AND Sprint = 362 AND statusCategory = 'In Progress' AND status = 'DEV Deploy WIP'"
+        def build = /project = 'SDG-CMART' AND Sprint =/ + SPN +/ AND statusCategory = 'In Progress' AND status = 'Jenkins DEV WIP'/
+        def searchResults = jiraJqlSearch jql: build
+        def issueNos = searchResultsQuery.data.issues
+        def comment = [ body: 'Comment from Jenkins. Negative transition for deployment %BUILD_DISPLAY_NAME%!' ]
+        for (i = 0; i < issueNos.size(); i++){
+            def transInput = [
+                transition: [
+                    id: '531'
+                ]
+            ]
+            jiraTransitionIssue idOrKey: issueNos[i].key, input: transInput
+            jiraAddComment idOrKey: issueNos[i].key, input: comment
+        }
+    }
+}
+    
+def FTA2TestTransitionIssue(){
+    withEnv(['JIRA_SITE=JIRA_CMART']){
+        //def searchResults = jiraJqlSearch jql: "project = 'SDG-CMART' AND Sprint = 362 AND statusCategory = 'Done' AND status = 'Dev Deploy Pass'"
+        def build = /project = 'SDG-CMART' AND Sprint =/ + SPN +/ AND statusCategory = 'In Progress' AND status = 'Jenkins DEV WIP'/
+        def searchResults = jiraJqlSearch jql: build
+        def issues = searchResults.data.issues
+        def comment = [ body: 'Comment from Jenkins. Positive transition for deployment in %BUILD_DISPLAY_NAME%!' ]
+        for (i = 0; i <issues.size(); i++) {
+            def transitionInput = [
+                transition: [
+                    id: '141'
+                ]
+            ]
+            jiraTransitionIssue idOrKey: issues[i].key, input: transitionInput
+            jiraAddComment idOrKey: issues[i].key, input: comment
+        }
+    }
+}
+
+def successfulTestTransitionIssue(){
+    withEnv(['JIRA_SITE=JIRA_CMART']){
+        //def searchResults = jiraJqlSearch jql: "project = 'SDG-CMART' AND Sprint = 362 AND statusCategory = 'In Progress' AND status = 'Functional Test  WIP'"
+        def build = /project = 'SDG-CMART' AND Sprint =/ + SPN +/ AND statusCategory = 'In Progress' AND status = 'Jenkins DEV WIP'/
+        def searchResults = jiraJqlSearch jql: build
+        def issues = searchResults.data.issues
+        def comment = [ body: 'Comment from Jenkins. Positive transition for %BUILD_DISPLAY_NAME%' ]
+        for (i = 0; i <issues.size(); i++) {
+            def transitionInput = [
+                transition: [
+                    id: '151'
+                ]
+            ]
+            jiraTransitionIssue idOrKey: issues[i].key, input: transitionInput
+            jiraAddComment idOrKey: issues[i].key, input: comment
+        }
+    }
+}
+
+def unsuccessfulTestTransitionIssue(){
+    withEnv(['JIRA_SITE=JIRA_CMART']){
+        //def searchResultsQuery = jiraJqlSearch jql: "project = 'SDG-CMART' AND Sprint = 362  AND statusCategory = 'In Progress' AND status = 'Functional Test  WIP'"
+        def build = /project = 'SDG-CMART' AND Sprint =/ + SPN +/ AND statusCategory = 'In Progress' AND status = 'Jenkins DEV WIP'/
+        def searchResults = jiraJqlSearch jql: build
+        def issueNos = searchResultsQuery.data.issues
+        def comment = [ body: 'Comment from Jenkins. Negative transition for %BUILD_DISPLAY_NAME%!' ]
+        for (i = 0; i < issueNos.size(); i++){
+            def transInput = [
+                transition: [
+                    id: '161'
+                ]
+            ]
+            jiraTransitionIssue idOrKey: issueNos[i].key, input: transInput
+            jiraAddComment idOrKey: issueNos[i].key, input: comment
+        }
+    }
+}

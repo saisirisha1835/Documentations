@@ -1,0 +1,122 @@
+pipeline{
+    agent{
+        label "node"
+    }
+
+    parameters {
+        choice(choices: ['Demo_DevOps', 'Development', 'UAT', 'LIVE'], description: 'Mention whether the project is Development or UAT or LIVE', name: 'folderName')
+        string(defaultValue: '', description: 'Mention the project base name', name: 'projectBaseName')
+        string(defaultValue: '', description: 'Mention the project name', name: 'projectName')
+        string(defaultValue: '', description: 'Mention your CR number', name: 'CRN')
+    }
+
+    stages{
+        stage("scm-checkout"){
+            steps{
+                echo "Checking out SVN folder to the workspace"
+                echo "The folder name is: ${params.folderName}"
+                echo "The project base name is: ${params.projectBaseName}"
+                echo "The project name is: ${params.projectName}"
+                checkout(poll: false, scm: [$class: 'SubversionSCM', 
+                additionalCredentials: [], excludedCommitMessages: '', 
+                excludedRegions: '', excludedRevprop: '', excludedUsers: '', 
+                filterChangelog: false, ignoreDirPropChanges: false, 
+                includedRegions: '', locations: [[cancelProcessOnExternalsFail: true, 
+                credentialsId: 'FCRS_Milind', depthOption: 'infinity', ignoreExternalsOption: true, 
+                local: '.', 
+                remote: 'https://mlxsdgsvn.icicibankltd.com/svn/BT3_120_FinancialConglomerateReportingSystem_FCRS_/120-FCRS/Miscellaneous/${folderName}/${projectBaseName}/${projectName}']], 
+                quietOperation: true, workspaceUpdater: [$class: 'UpdateUpdater']])
+            }
+            post{
+                success{
+                    echo "Checkout step was successful!"
+                }
+                failure{
+                    echo "Checkout step has failed!"
+                }
+            }
+        }
+
+        stage("approval for build"){
+            steps{
+                timeout(time: 45, unit: 'SECONDS') {
+                    input(id: '100', message: 'Continue with the Build?', ok: 'Approved', submitter: '\'Admininstrator\'', 
+                    submitterParameter: 'approvalAuth')
+                }
+            }
+        }
+
+        stage("Compilation and Package-gen"){
+            steps{
+                bat label: 'chdir', script: 'cd "C:\\Windows\\Microsoft.NET\\Framework\\v3.5"'
+                bat label: 'msbuild-step', script: 'MSBuild.exe "LCR_EscalationScheduler.csproj" /p:Configuration=Debug /p:DeployOnBuild=True /p:AllowUntrustedCertificate=True /p:CreatePackageOnPublish=True '
+            }
+            post{
+                 success{
+                    echo "Build is successful"
+                }
+                failure{
+                    echo "Build has failed"
+                }
+            }
+        }
+
+        stage("Nexus Package Publishing"){
+            steps{
+                nexusArtifactUploader(artifacts: [[artifactId: 'LCR_EscalationScheduler', classifier: '', 
+                file: 'obj\\Debug\\LCR_EscalationScheduler.exe', type: 'exe']], credentialsId: 'NexusRepoSDG', 
+                groupId: 'com.icici.sdg.LCRScheduler', nexusUrl: '10.75.21.109:9043/repository/SDG_FCRS_LCR/', 
+                nexusVersion: 'nexus3', protocol: 'http', repository: 'SDG_FCRS_LCR', version: '$CRN_$BUILD_ID')
+            }
+            post{
+                success{
+                    echo "Package has been published to a nexus repository"
+                }
+                failure{
+                    echo "Package couldn't be published to a nexus repository"
+                }
+            }
+        }
+    }
+    post{
+        always{
+            echo "========always========"
+        }
+        success{
+            echo "========pipeline executed successfully ========"
+            echo "Now migrating the issue status workflow positvely"
+            postFailedBuildSteps{
+                steps{
+                    jqlSearch('project = "ICICI SDG" AND Sprint = 174 AND statusCategory = "In Progress" AND status = "Jenkins Dev"')
+                    workflowActionName('CI Pass')
+                    comment('$JENKINS_ID')
+                }
+            }
+        }
+        failure{
+            echo "========pipeline execution failed========"
+            echo "Creating a new JIRA issue ticket"
+
+            script{
+                def testIssue = [fields: [ // id or key must present for project.
+                               project: [id: '10600'],
+                               summary: 'New JIRA ticket created by Jenkins.',
+                               description: '$BUILD_ID',
+                               // id or name must present for issueType.
+                               issuetype: [id: '10004']]]
+                response = jiraNewIssue issue: testIssue
+                echo response.successful.toString()
+                echo response.data.toString()
+            }
+
+            echo "Now migrating the issue status workflow negatively"
+            postFailedBuildSteps{
+                steps{
+                    jqlSearch('project = "ICICI SDG" AND Sprint = 174 AND statusCategory = "In Progress" AND status = "Jenkins Dev"')
+                    workflowActionName('CI Fail')
+                    comment('$JENKINS_ID')
+                }
+            }    
+        }
+    }
+}

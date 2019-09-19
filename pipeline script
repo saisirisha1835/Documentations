@@ -1,0 +1,75 @@
+node {
+    deleteDir()
+    try{
+        stage("SCM Code Checkout"){
+            echo "Checking out SVN folder to the workspace"
+            echo "The folder name is: ${env.folderName}"
+            echo "The project base name is: ${env.projectBaseName}"
+            echo "The project name is: ${env.projectName}"
+            echo "The CR Number is: ${env.CRN}"
+            checkout(poll: false, scm: [$class: 'SubversionSCM', 
+            additionalCredentials: [], excludedCommitMessages: '', 
+            excludedRegions: '', excludedRevprop: '', excludedUsers: '', 
+            filterChangelog: false, ignoreDirPropChanges: false, 
+            includedRegions: '', locations: [[cancelProcessOnExternalsFail: true, 
+            credentialsId: 'FCRS_Milind', depthOption: 'infinity', ignoreExternalsOption: true, 
+            local: '.', 
+            remote: 'https://mlxsdgsvn.icicibankltd.com/svn/BT3_120_FinancialConglomerateReportingSystem_FCRS_/120-FCRS/Miscellaneous/${env.folderName}/${env.projectBaseName}/${env.projectName}']], 
+            quietOperation: true, workspaceUpdater: [$class: 'UpdateUpdater']])
+        }
+
+        stage("Approval for Build"){
+            timeout(time: 45, unit: 'SECONDS') {
+                input(id: '100', message: 'Continue with the Build?', ok: 'Approved', submitter: '\'Admininstrator\'', 
+                submitterParameter: 'approvalAuth')
+            }
+        }
+
+        try {
+            stage("Compilation and Package Generation"){
+                println "Now proceeding for source compilation using MSBuild executable"
+                bat label: 'msbuild-step', script: 'C:\\Windows\\Microsoft.NET\\Framework\\v3.5\\MSBuild.exe "TP_UploadFileSchedular.csproj" /p:Configuration=Debug /p:DeployOnBuild=True /p:AllowUntrustedCertificate=True /p:CreatePackageOnPublish=True '
+            }
+        } catch (err){
+            println("Unable to compile...there were some errors!")
+            createJira()
+            currentBuild.result = "FAILURE"
+            error()
+        }
+
+        try {
+            stage("Publish to Nexus Repository"){
+                nexusArtifactUploader(artifacts: [[artifactId: 'TP_UploadFileSchedular', classifier: '', 
+                file: 'obj\\Debug\\TP_UploadFileSchedular.exe', type: 'exe']], credentialsId: 'NexusRepoSDG', 
+                groupId: 'com.icici.sdg.LCRScheduler', nexusUrl: '10.75.21.109:9043/repository/SDG_FCRS_LCR/', 
+                nexusVersion: 'nexus3', protocol: 'http', repository: 'SDG_FCRS_LCR', version: '${env.CRN}_${env.BUILD_TIMESTAMP}')
+            }
+        } catch(err){
+            println("Unable to publish your artifact to Nexus!!!")
+            createJira()
+            currentBuild.result = "FAILURE"
+            error()
+        }
+
+        stage("Build Change Name") {
+            currentBuild.displayName = "SDG-${env.CRN}-${env.BUILD_TIMESTAMP}"
+        }
+    } catch(err){
+        println("=================ERROR: ${err}")
+        currentBuild.displayName = "SDG-${env.CRN}-${env.BUILD_TIMESTAMP}"
+        currentBuild.result = "FAILURE"
+        error()        
+    }
+}
+
+def createJira(){
+    withEnv(['JIRA_SITE=JIRA Pipeline UAT']){
+        def failIssue = [fields: [project: [id: '10600'],
+                        summary: 'Please find below the execution log ${env.CRN}',
+                        description: 'JIRA ticket created from build failure - ${env.CRN} # ${env.BUILD_TIMESTAMP}',
+                        issueType: [id: '10004']]]
+        response = jiraNewIssue issue: failIssue
+        echo response.successful.toString()
+        echo response.data.toString()
+    }
+}
